@@ -20,11 +20,11 @@ HAND_PATH = str(_ASSETS_DIR / "drawing-hand.png")
 HAND_MASK_PATH = str(_ASSETS_DIR / "hand-mask.png")
 
 # === 固定算法参数 ===
-FRAME_RATE = 25
+FRAME_RATE = 60
 SPLIT_LEN = 20
 END_IMG_DURATION = 2
 MAX_1080P = True
-DEFAULT_DURATION = 30
+DEFAULT_DURATION = 10
 SKIP_RATE = 4
 
 
