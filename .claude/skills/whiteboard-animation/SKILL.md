@@ -42,29 +42,22 @@ python <skill目录>/scripts/setup_env.py
 |------|------|--------|------|
 | 图片路径 | 位置参数（必填） | -- | 输入的彩色图片路径 |
 | 输出目录 | `--output-dir` | `./output` | 视频输出目录 |
-| 速度 | `--speed` | `8` | 动画跳帧率（越大越快，帧数越少） |
+| 时长 | `--duration` | `30` | 视频总时长（秒），生成的视频会精确匹配该时长 |
 | 无手部 | `--no-hand` | 默认显示手 | 禁用手部覆盖效果 |
-
-速度参考：
-- `4-6`：慢速，细节丰富（视频更长，文件更大）
-- `8`：默认平衡速度
-- `12-16`：快速（视频更短，文件更小）
 
 ### 第四步：运行生成脚本
 
 使用第一步获取的 `PYTHON_PATH` 运行生成脚本：
 
 ```bash
-<PYTHON_PATH> <skill目录>/scripts/generate_whiteboard.py <图片路径> [--output-dir <目录>] [--speed <N>] [--no-hand]
+<PYTHON_PATH> <skill目录>/scripts/generate_whiteboard.py <图片路径> [--output-dir <目录>] [--duration <秒>] [--no-hand]
 ```
 
 示例：
 
 ```bash
-<PYTHON_PATH> <skill目录>/scripts/generate_whiteboard.py /path/to/photo.png --output-dir ./output --speed 8
+<PYTHON_PATH> <skill目录>/scripts/generate_whiteboard.py /path/to/photo.png --output-dir ./output --duration 20
 ```
-
-生成耗时约 30 秒到数分钟，取决于图片复杂度和分辨率。
 
 ### 第五步：返回结果
 
@@ -74,5 +67,5 @@ python <skill目录>/scripts/setup_env.py
 
 - **`ModuleNotFoundError`**：重新运行 `setup_env.py` 确保依赖完整安装。
 - **输出全黑/无内容**：输入图片可能太暗，建议使用浅色背景的图片。
-- **输出文件过大**：增大 `--speed` 值（如 `--speed 14`）以减少帧数。
+- **输出文件过大**：减小 `--duration` 值以缩短视频时长。
 - **虚拟环境创建失败**：确认系统已安装 Python 3.8+，且 `python3` 命令可用。

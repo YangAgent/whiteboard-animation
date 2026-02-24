@@ -24,6 +24,8 @@ FRAME_RATE = 25
 SPLIT_LEN = 20
 END_IMG_DURATION = 2
 MAX_1080P = True
+DEFAULT_DURATION = 30
+SKIP_RATE = 4
 
 
 # === 核心函数 ===
@@ -115,7 +117,32 @@ def draw_hand_on_img(drawing, hand, x, y, hand_mask_inv, hand_ht, hand_wd, img_h
     return drawing
 
 
-def draw_masked_object(variables, skip_rate=5):
+def _sort_cells_by_nearest(indices):
+    """将格子索引按最近邻排序，返回排序后的数组"""
+    indices = indices.copy()
+    sorted_list = [indices[0]]
+    remaining = indices[1:]
+    while len(remaining) > 0:
+        last = sorted_list[-1]
+        dists = euc_dist(remaining, last)
+        nearest = np.argmin(dists)
+        sorted_list.append(remaining[nearest].copy())
+        remaining[nearest] = remaining[-1]
+        remaining = remaining[:-1]
+    return np.array(sorted_list)
+
+
+def _sample_cells(sorted_cells, target_count):
+    """从排序后的格子中均匀采样/扩展到目标数量"""
+    n = len(sorted_cells)
+    if target_count == n:
+        return sorted_cells
+    # 无论目标多于或少于实际数量，都通过 linspace 均匀映射
+    indices = np.round(np.linspace(0, n - 1, target_count)).astype(int)
+    return sorted_cells[indices]
+
+
+def draw_masked_object(variables, target_cells, skip_rate=SKIP_RATE):
     img_thresh_copy = variables["img_thresh"].copy()
     split_len = variables["split_len"]
     resize_ht = variables["resize_ht"]
@@ -130,22 +157,24 @@ def draw_masked_object(variables, skip_rate=5):
     cut_having_black = (grid_of_cuts < 10) * 1
     cut_having_black = np.sum(np.sum(cut_having_black, axis=-1), axis=-1)
     cut_black_indices = np.array(np.where(cut_having_black > 0)).T
-    total_cells = len(cut_black_indices)
-    print(f"  网格总数: {n_cuts_vertical}x{n_cuts_horizontal}, 有内容的格子: {total_cells}")
+    actual_cells = len(cut_black_indices)
+    print(f"  网格总数: {n_cuts_vertical}x{n_cuts_horizontal}, 有内容的格子: {actual_cells}, 目标格子数: {target_cells}")
 
-    selected_ind = 0
-    counter = 0
-    while len(cut_black_indices) > 1:
-        selected_ind_val = cut_black_indices[selected_ind].copy()
-        range_v_start = selected_ind_val[0] * split_len
+    # 按最近邻排序后均匀采样
+    sorted_cells = _sort_cells_by_nearest(cut_black_indices)
+    sampled_cells = _sample_cells(sorted_cells, target_cells)
+    total = len(sampled_cells)
+
+    for i, cell in enumerate(sampled_cells):
+        range_v_start = cell[0] * split_len
         range_v_end = range_v_start + split_len
-        range_h_start = selected_ind_val[1] * split_len
+        range_h_start = cell[1] * split_len
         range_h_end = range_h_start + split_len
 
         temp_drawing = np.zeros((split_len, split_len, 3))
-        temp_drawing[:, :, 0] = grid_of_cuts[selected_ind_val[0]][selected_ind_val[1]]
-        temp_drawing[:, :, 1] = grid_of_cuts[selected_ind_val[0]][selected_ind_val[1]]
-        temp_drawing[:, :, 2] = grid_of_cuts[selected_ind_val[0]][selected_ind_val[1]]
+        temp_drawing[:, :, 0] = grid_of_cuts[cell[0]][cell[1]]
+        temp_drawing[:, :, 1] = grid_of_cuts[cell[0]][cell[1]]
+        temp_drawing[:, :, 2] = grid_of_cuts[cell[0]][cell[1]]
 
         variables["drawn_frame"][range_v_start:range_v_end, range_h_start:range_h_end] = temp_drawing
 
@@ -163,22 +192,28 @@ def draw_masked_object(variables, skip_rate=5):
         else:
             drawn_frame_with_hand = variables["drawn_frame"].copy()
 
-        cut_black_indices[selected_ind] = cut_black_indices[-1]
-        cut_black_indices = cut_black_indices[:-1]
-        del selected_ind
-
-        euc_arr = euc_dist(cut_black_indices, selected_ind_val)
-        selected_ind = np.argmin(euc_arr)
-
-        counter += 1
+        counter = i + 1
         if counter % skip_rate == 0:
             variables["video_object"].write(drawn_frame_with_hand.astype(np.uint8))
 
         if counter % 100 == 0:
-            pct = int(counter / total_cells * 100)
-            print(f"  进度: {pct}% ({counter}/{total_cells})")
+            pct = int(counter / total * 100)
+            print(f"  进度: {pct}% ({counter}/{total})")
 
-    print(f"  绘制完成，共 {counter} 步")
+    # 确保最后一帧内容完整写入（补齐所有未采样的格子到画布）
+    for cell in sorted_cells:
+        r, c_idx = cell[0], cell[1]
+        range_v_start = r * split_len
+        range_v_end = range_v_start + split_len
+        range_h_start = c_idx * split_len
+        range_h_end = range_h_start + split_len
+        temp = np.zeros((split_len, split_len, 3))
+        temp[:, :, 0] = grid_of_cuts[r][c_idx]
+        temp[:, :, 1] = grid_of_cuts[r][c_idx]
+        temp[:, :, 2] = grid_of_cuts[r][c_idx]
+        variables["drawn_frame"][range_v_start:range_v_end, range_h_start:range_h_end] = temp
+
+    print(f"  绘制完成，共 {total} 步")
 
 
 def _build_brush_mask(radius):
@@ -214,7 +249,7 @@ def _apply_brush(drawn_frame, color_img, cx, cy, brush_mask, radius):
         ).astype(np.uint8)
 
 
-def colorize_animation(variables, skip_rate=8, brush_radius=50):
+def colorize_animation(variables, target_cells, skip_rate=SKIP_RATE, brush_radius=50):
     """
     第二阶段：上色。沿素描阶段同样的路径上色，手跟随移动。
     用圆形笔刷+羽化边缘替代矩形格子，模拟真实画笔上色效果。
@@ -236,21 +271,22 @@ def colorize_animation(variables, skip_rate=8, brush_radius=50):
     cut_having_black = (grid_of_cuts < 10) * 1
     cut_having_black = np.sum(np.sum(cut_having_black, axis=-1), axis=-1)
     cut_black_indices = np.array(np.where(cut_having_black > 0)).T
-    total_cells = len(cut_black_indices)
+
+    # 按最近邻排序后均匀采样
+    sorted_cells = _sort_cells_by_nearest(cut_black_indices)
+    sampled_cells = _sample_cells(sorted_cells, target_cells)
+    total = len(sampled_cells)
 
     brush_mask = _build_brush_mask(brush_radius)
-    print(f"  上色格子数: {total_cells} (笔刷半径: {brush_radius}px)")
+    print(f"  上色格子数: {total} (笔刷半径: {brush_radius}px)")
 
-    selected_ind = 0
-    counter = 0
-    while len(cut_black_indices) > 1:
-        selected_ind_val = cut_black_indices[selected_ind].copy()
-        r, c = selected_ind_val[0], selected_ind_val[1]
-
+    for i, cell in enumerate(sampled_cells):
+        r, c = cell[0], cell[1]
         cx = c * split_len + split_len // 2
         cy = r * split_len + split_len // 2
 
-        _apply_brush(variables["drawn_frame"], color_img, cx, cy, brush_mask, brush_radius)
+        _apply_brush(variables["drawn_frame"], color_img,
+                     cx, cy, brush_mask, brush_radius)
 
         if variables["draw_hand"]:
             drawn_frame_with_hand = draw_hand_on_img(
@@ -262,25 +298,23 @@ def colorize_animation(variables, skip_rate=8, brush_radius=50):
                 resize_ht, resize_wd,
             )
         else:
-            drawn_frame_with_hand = variables["drawn_frame"].copy().astype(np.uint8)
+            drawn_frame_with_hand = (
+                variables["drawn_frame"].copy().astype(np.uint8)
+            )
 
-        cut_black_indices[selected_ind] = cut_black_indices[-1]
-        cut_black_indices = cut_black_indices[:-1]
-        del selected_ind
-
-        euc_arr = euc_dist(cut_black_indices, selected_ind_val)
-        selected_ind = np.argmin(euc_arr)
-
-        counter += 1
+        counter = i + 1
         if counter % skip_rate == 0:
-            variables["video_object"].write(drawn_frame_with_hand.astype(np.uint8))
+            variables["video_object"].write(
+                drawn_frame_with_hand.astype(np.uint8)
+            )
 
         if counter % 100 == 0:
-            pct = int(counter / total_cells * 100)
+            pct = int(counter / total * 100)
             print(f"  上色进度: {pct}%")
 
+    # 确保最终画面是完整的彩色原图
     variables["drawn_frame"] = variables["img"].astype(np.float32).copy()
-    print(f"  上色完成，共 {counter} 步")
+    print(f"  上色完成，共 {total} 步")
 
 
 def ffmpeg_convert(source_vid, dest_vid):
@@ -328,10 +362,10 @@ def parse_args():
         help="输出目录 (默认: ./output)"
     )
     parser.add_argument(
-        "--speed",
+        "--duration",
         type=int,
-        default=8,
-        help="动画跳帧率，越大越快 (默认: 8)"
+        default=DEFAULT_DURATION,
+        help=f"视频总时长，单位秒 (默认: {DEFAULT_DURATION})"
     )
     parser.add_argument(
         "--no-hand",
@@ -346,8 +380,9 @@ def main():
 
     image_path = args.image_path
     output_dir = args.output_dir
-    skip_rate = args.speed
+    duration = args.duration
     draw_hand = not args.no_hand
+    skip_rate = SKIP_RATE
 
     print("=" * 50)
     print("白板手绘动画生成器")
@@ -406,6 +441,16 @@ def main():
         variables = preprocess_hand_image(HAND_PATH, HAND_MASK_PATH, variables)
         print(f"  手部尺寸: {variables['hand_wd']}x{variables['hand_ht']}")
 
+    # 根据 duration 反算每阶段目标格子数
+    end_frames = FRAME_RATE * END_IMG_DURATION
+    total_frames = duration * FRAME_RATE
+    anim_frames = total_frames - end_frames
+    frames_per_phase = anim_frames // 2
+    target_cells = frames_per_phase * skip_rate
+    print(f"\n时长计算: {duration}秒 = {total_frames}帧")
+    print(f"  动画帧: {anim_frames}, 每阶段: {frames_per_phase}帧")
+    print(f"  skip_rate={skip_rate}, 目标格子数: {target_cells}")
+
     # 创建视频写入器
     fourcc = cv2.VideoWriter_fourcc(*"mp4v")
     variables["video_object"] = cv2.VideoWriter(
@@ -413,17 +458,22 @@ def main():
     )
 
     # 创建空白画布
-    variables["drawn_frame"] = np.zeros(variables["img"].shape, np.uint8) + np.array([255, 255, 255], np.uint8)
+    variables["drawn_frame"] = (
+        np.zeros(variables["img"].shape, np.uint8)
+        + np.array([255, 255, 255], np.uint8)
+    )
 
     # 开始绘制动画
     print(f"\n开始生成动画 (split_len={SPLIT_LEN}, skip_rate={skip_rate})...")
     start_time = time.time()
 
-    draw_masked_object(variables, skip_rate=skip_rate)
+    draw_masked_object(variables, target_cells, skip_rate=skip_rate)
 
     # 第二阶段：上色
-    print(f"\n开始上色阶段...")
-    colorize_animation(variables, skip_rate=skip_rate, brush_radius=50)
+    print("\n开始上色阶段...")
+    colorize_animation(
+        variables, target_cells, skip_rate=skip_rate, brush_radius=50
+    )
 
     # 结尾展示完整彩色原图
     end_img = variables["img"]
