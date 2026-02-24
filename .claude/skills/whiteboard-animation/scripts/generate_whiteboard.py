@@ -20,7 +20,7 @@ HAND_PATH = str(_ASSETS_DIR / "drawing-hand.png")
 
 # === 固定算法参数 ===
 FRAME_RATE = 60
-SPLIT_LEN = 20
+SPLIT_LEN = 10
 END_IMG_DURATION = 2
 MAX_1080P = True
 DEFAULT_DURATION = 10
@@ -111,173 +111,6 @@ def draw_hand_on_img(drawing, hand, x, y, hand_mask, hand_mask_inv, hand_ht, han
     return drawing
 
 
-def _split_by_projection(indices, min_gap=2):
-    """递归投影分割：找空白列/行间隙，将格子切分成独立视觉区域"""
-    if len(indices) <= 1:
-        return [indices]
-
-    def _find_splits(coords, min_c, max_c, min_gap):
-        """在 [min_c, max_c] 范围内找连续空白间隙"""
-        occupied = set(coords)
-        splits = []
-        gap_start = None
-        for c in range(min_c, max_c + 1):
-            if c not in occupied:
-                if gap_start is None:
-                    gap_start = c
-            else:
-                if gap_start is not None and c - gap_start >= min_gap:
-                    splits.append((gap_start, c - 1))
-                gap_start = None
-        if gap_start is not None and (max_c + 1) - gap_start >= min_gap:
-            splits.append((gap_start, max_c))
-        return splits
-
-    def _recurse(idx_arr, depth=0):
-        if len(idx_arr) <= 1 or depth > 4:
-            return [idx_arr]
-        # 交替：偶数层切垂直（按列），奇数层切水平（按行）
-        if depth % 2 == 0:
-            coords = idx_arr[:, 1]  # 列
-        else:
-            coords = idx_arr[:, 0]  # 行
-        min_c, max_c = int(coords.min()), int(coords.max())
-        splits = _find_splits(set(coords.tolist()), min_c, max_c, min_gap)
-        if not splits:
-            # 当前方向没有间隙，换另一个方向再试一次
-            if depth % 2 == 0:
-                coords2 = idx_arr[:, 0]
-            else:
-                coords2 = idx_arr[:, 1]
-            min_c2, max_c2 = int(coords2.min()), int(coords2.max())
-            splits2 = _find_splits(
-                set(coords2.tolist()), min_c2, max_c2, min_gap
-            )
-            if not splits2:
-                return [idx_arr]
-            # 用另一方向的间隙切分
-            boundaries = [min_c2] + [s[0] for s in splits2] + [max_c2 + 1]
-            result = []
-            for i in range(len(boundaries) - 1):
-                lo, hi = boundaries[i], boundaries[i + 1]
-                if i > 0:
-                    lo = splits2[i - 1][1] + 1
-                mask = (coords2 >= lo) & (coords2 < hi)
-                if mask.any():
-                    result.extend(_recurse(idx_arr[mask], depth + 1))
-            return result if result else [idx_arr]
-        # 用间隙切分
-        boundaries = [min_c] + [s[0] for s in splits] + [max_c + 1]
-        result = []
-        for i in range(len(boundaries) - 1):
-            lo, hi = boundaries[i], boundaries[i + 1]
-            if i > 0:
-                lo = splits[i - 1][1] + 1
-            mask = (coords >= lo) & (coords < hi)
-            if mask.any():
-                result.extend(_recurse(idx_arr[mask], depth + 1))
-        return result if result else [idx_arr]
-
-    return _recurse(indices)
-
-
-def _dbscan_numpy(indices, eps=3.0):
-    """纯 numpy DBSCAN 聚类，返回聚类列表"""
-    n = len(indices)
-    if n <= 1:
-        return [indices]
-    # 计算 pairwise 距离
-    pts = indices.astype(np.float64)
-    diff = pts[:, np.newaxis, :] - pts[np.newaxis, :, :]
-    dists = np.sqrt((diff ** 2).sum(axis=2))
-    # 找邻居
-    neighbors = [np.where(dists[i] <= eps)[0] for i in range(n)]
-    labels = -np.ones(n, dtype=int)
-    cluster_id = 0
-    for i in range(n):
-        if labels[i] != -1:
-            continue
-        # 扩展聚类
-        queue = list(neighbors[i])
-        labels[i] = cluster_id
-        while queue:
-            j = queue.pop(0)
-            if labels[j] != -1:
-                continue
-            labels[j] = cluster_id
-            queue.extend(neighbors[j].tolist())
-        cluster_id += 1
-    return [indices[labels == cid] for cid in range(cluster_id)]
-
-
-def _sort_cells_local(indices, alpha=0.5):
-    """带从左到右偏好的最近邻排序，避免在聚类内部频繁回退"""
-    n = len(indices)
-    if n <= 1:
-        return indices.copy()
-    pool = indices.copy()
-    # 从最左上的格子开始
-    start = np.lexsort((pool[:, 0], pool[:, 1]))[0]
-    # 把起始点交换到位置 0
-    pool[[0, start]] = pool[[start, 0]]
-    tail = n  # pool[:tail] 是剩余候选
-    result = np.empty_like(pool)
-    result[0] = pool[0]
-    tail -= 1
-    # 把已选的位置 0 换到末尾
-    pool[[0, tail]] = pool[[tail, 0]]
-    for i in range(1, n):
-        last = result[i - 1]
-        candidates = pool[:tail]
-        dists = euc_dist(candidates, last)
-        # 对向左回退的格子加惩罚
-        backward = np.maximum(0, last[1] - candidates[:, 1]).astype(float)
-        effective_dists = dists + alpha * backward
-        nearest = np.argmin(effective_dists)
-        result[i] = candidates[nearest]
-        tail -= 1
-        pool[[nearest, tail]] = pool[[tail, nearest]]
-    return result
-
-
-def _build_drawing_path(indices, target_count):
-    """三阶段管线：投影分割 → 距离聚类 → 聚类内排序 + 按比例采样"""
-    # Stage 1: 投影分割
-    regions = _split_by_projection(indices, min_gap=2)
-    # Stage 2: 距离聚类
-    clusters = []
-    for region in regions:
-        if len(region) == 0:
-            continue
-        sub = _dbscan_numpy(region, eps=3.0)
-        clusters.extend(sub)
-    clusters = [c for c in clusters if len(c) > 0]
-    if not clusters:
-        return indices
-    # 按阅读顺序排列聚类（先左后右、先上后下）
-    cluster_keys = [(c[:, 1].min(), c[:, 0].min()) for c in clusters]
-    order = sorted(range(len(clusters)), key=lambda i: cluster_keys[i])
-    clusters = [clusters[i] for i in order]
-    # Stage 3: 聚类内排序
-    sorted_clusters = [_sort_cells_local(c) for c in clusters]
-    # 按比例分配目标帧数，组内独立采样
-    total_cells = sum(len(c) for c in sorted_clusters)
-    result = []
-    remaining_target = target_count
-    remaining_cells = total_cells
-    for cl in sorted_clusters:
-        if remaining_cells <= 0:
-            break
-        group_target = round(len(cl) / remaining_cells * remaining_target)
-        group_target = max(group_target, 1)
-        n = len(cl)
-        sample_idx = np.round(np.linspace(0, n - 1, group_target)).astype(int)
-        result.append(cl[sample_idx])
-        remaining_target -= group_target
-        remaining_cells -= len(cl)
-    return np.concatenate(result)
-
-
 def draw_masked_object(variables, target_cells, skip_rate=SKIP_RATE):
     img_thresh_copy = variables["img_thresh"].copy()
     split_len = variables["split_len"]
@@ -294,22 +127,25 @@ def draw_masked_object(variables, target_cells, skip_rate=SKIP_RATE):
     cut_having_black = np.sum(np.sum(cut_having_black, axis=-1), axis=-1)
     cut_black_indices = np.array(np.where(cut_having_black > 0)).T
     actual_cells = len(cut_black_indices)
-    print(f"  网格总数: {n_cuts_vertical}x{n_cuts_horizontal}, 有内容的格子: {actual_cells}, 目标格子数: {target_cells}")
+    target_frames = target_cells // skip_rate if skip_rate > 0 else actual_cells
+    print(f"  网格总数: {n_cuts_vertical}x{n_cuts_horizontal}, 有内容的格子: {actual_cells}, 目标帧: {target_frames}")
 
-    # 三阶段路径排序：投影分割 → 距离聚类 → 聚类内排序
-    sampled_cells = _build_drawing_path(cut_black_indices, target_cells)
-    total = len(sampled_cells)
-
-    for i, cell in enumerate(sampled_cells):
-        range_v_start = cell[0] * split_len
+    selected_ind = 0
+    counter = 0
+    frame_accumulator = 0.0
+    frames_written = 0
+    frame_ratio = target_frames / actual_cells if actual_cells > 0 else 1.0
+    while len(cut_black_indices) > 1:
+        selected_ind_val = cut_black_indices[selected_ind].copy()
+        range_v_start = selected_ind_val[0] * split_len
         range_v_end = range_v_start + split_len
-        range_h_start = cell[1] * split_len
+        range_h_start = selected_ind_val[1] * split_len
         range_h_end = range_h_start + split_len
 
         temp_drawing = np.zeros((split_len, split_len, 3))
-        temp_drawing[:, :, 0] = grid_of_cuts[cell[0]][cell[1]]
-        temp_drawing[:, :, 1] = grid_of_cuts[cell[0]][cell[1]]
-        temp_drawing[:, :, 2] = grid_of_cuts[cell[0]][cell[1]]
+        temp_drawing[:, :, 0] = grid_of_cuts[selected_ind_val[0]][selected_ind_val[1]]
+        temp_drawing[:, :, 1] = grid_of_cuts[selected_ind_val[0]][selected_ind_val[1]]
+        temp_drawing[:, :, 2] = grid_of_cuts[selected_ind_val[0]][selected_ind_val[1]]
 
         variables["drawn_frame"][range_v_start:range_v_end, range_h_start:range_h_end] = temp_drawing
 
@@ -328,25 +164,26 @@ def draw_masked_object(variables, target_cells, skip_rate=SKIP_RATE):
         else:
             drawn_frame_with_hand = variables["drawn_frame"].copy()
 
-        counter = i + 1
-        if counter % skip_rate == 0:
-            variables["video_object"].write(drawn_frame_with_hand.astype(np.uint8))
+        cut_black_indices[selected_ind] = cut_black_indices[-1]
+        cut_black_indices = cut_black_indices[:-1]
+
+        euc_arr = euc_dist(cut_black_indices, selected_ind_val)
+        selected_ind = np.argmin(euc_arr)
+
+        counter += 1
+        frame_accumulator += frame_ratio
+        n_frames = int(frame_accumulator) - frames_written
+        if n_frames > 0:
+            frame = drawn_frame_with_hand.astype(np.uint8)
+            for _ in range(n_frames):
+                variables["video_object"].write(frame)
+            frames_written += n_frames
 
         if counter % 100 == 0:
-            pct = int(counter / total * 100)
-            print(f"  进度: {pct}% ({counter}/{total})")
+            pct = int(counter / actual_cells * 100)
+            print(f"  进度: {pct}% ({counter}/{actual_cells})")
 
-    # 确保最后一帧内容完整写入（补齐所有未采样的格子到画布）
-    for cell in cut_black_indices:
-        r, c_idx = cell[0], cell[1]
-        vs = r * split_len
-        hs = c_idx * split_len
-        gray_block = grid_of_cuts[r][c_idx]
-        variables["drawn_frame"][vs:vs + split_len, hs:hs + split_len] = (
-            np.stack([gray_block] * 3, axis=-1)
-        )
-
-    print(f"  绘制完成，共 {total} 步")
+    print(f"  绘制完成，共 {counter} 步, 写入 {frames_written} 帧")
 
 
 def _build_brush_mask(radius):
@@ -403,16 +240,21 @@ def colorize_animation(variables, target_cells, skip_rate=SKIP_RATE, brush_radiu
     cut_having_black = (grid_of_cuts < 10) * 1
     cut_having_black = np.sum(np.sum(cut_having_black, axis=-1), axis=-1)
     cut_black_indices = np.array(np.where(cut_having_black > 0)).T
-
-    # 三阶段路径排序：投影分割 → 距离聚类 → 聚类内排序
-    sampled_cells = _build_drawing_path(cut_black_indices, target_cells)
-    total = len(sampled_cells)
+    actual_cells = len(cut_black_indices)
+    target_frames = target_cells // skip_rate if skip_rate > 0 else actual_cells
 
     brush_mask = _build_brush_mask(brush_radius)
-    print(f"  上色格子数: {total} (笔刷半径: {brush_radius}px)")
+    print(f"  上色格子数: {actual_cells} (笔刷半径: {brush_radius}px, 目标帧: {target_frames})")
 
-    for i, cell in enumerate(sampled_cells):
-        r, c = cell[0], cell[1]
+    selected_ind = 0
+    counter = 0
+    frame_accumulator = 0.0
+    frames_written = 0
+    frame_ratio = target_frames / actual_cells if actual_cells > 0 else 1.0
+    while len(cut_black_indices) > 1:
+        selected_ind_val = cut_black_indices[selected_ind].copy()
+        r, c = selected_ind_val[0], selected_ind_val[1]
+
         cx = c * split_len + split_len // 2
         cy = r * split_len + split_len // 2
 
@@ -434,17 +276,26 @@ def colorize_animation(variables, target_cells, skip_rate=SKIP_RATE, brush_radiu
                 variables["drawn_frame"].copy().astype(np.uint8)
             )
 
-        counter = i + 1
-        if counter % skip_rate == 0:
-            variables["video_object"].write(
-                drawn_frame_with_hand.astype(np.uint8)
-            )
+        cut_black_indices[selected_ind] = cut_black_indices[-1]
+        cut_black_indices = cut_black_indices[:-1]
+
+        euc_arr = euc_dist(cut_black_indices, selected_ind_val)
+        selected_ind = np.argmin(euc_arr)
+
+        counter += 1
+        frame_accumulator += frame_ratio
+        n_frames = int(frame_accumulator) - frames_written
+        if n_frames > 0:
+            frame = drawn_frame_with_hand.astype(np.uint8)
+            for _ in range(n_frames):
+                variables["video_object"].write(frame)
+            frames_written += n_frames
 
         if counter % 100 == 0:
-            pct = int(counter / total * 100)
+            pct = int(counter / actual_cells * 100)
             print(f"  上色进度: {pct}%")
 
-    print(f"  上色完成，共 {total} 步")
+    print(f"  上色完成，共 {counter} 步, 写入 {frames_written} 帧")
 
 
 def ffmpeg_convert(source_vid, dest_vid):
