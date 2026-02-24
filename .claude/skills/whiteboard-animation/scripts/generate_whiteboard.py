@@ -17,7 +17,6 @@ from pathlib import Path
 _SCRIPT_DIR = Path(os.path.dirname(os.path.abspath(__file__)))
 _ASSETS_DIR = _SCRIPT_DIR.parent / "assets"
 HAND_PATH = str(_ASSETS_DIR / "drawing-hand.png")
-HAND_MASK_PATH = str(_ASSETS_DIR / "hand-mask.png")
 
 # === 固定算法参数 ===
 FRAME_RATE = 60
@@ -37,7 +36,7 @@ def euc_dist(arr1, point):
 
 
 def get_extreme_coordinates(mask):
-    indices = np.where(mask == 255)
+    indices = np.where(mask > 0)
     x = indices[1]
     y = indices[0]
     topleft = (np.min(x), np.min(y))
@@ -57,9 +56,18 @@ def preprocess_image(img, variables):
     return variables
 
 
-def preprocess_hand_image(hand_path, hand_mask_path, variables):
-    hand = cv2.imread(hand_path)
-    hand_mask = cv2.imread(hand_mask_path, cv2.IMREAD_GRAYSCALE)
+def preprocess_hand_image(hand_path, variables):
+    hand_rgba = cv2.imread(hand_path, cv2.IMREAD_UNCHANGED)
+    if hand_rgba.shape[2] == 4:
+        # 透明背景 PNG：直接从 alpha 通道提取蒙版
+        hand_mask = hand_rgba[:, :, 3]
+        hand = hand_rgba[:, :, :3]
+    else:
+        # 无 alpha 通道的回退：用白色背景检测
+        hand = hand_rgba
+        gray = cv2.cvtColor(hand, cv2.COLOR_BGR2GRAY)
+        _, hand_mask = cv2.threshold(gray, 250, 255, cv2.THRESH_BINARY_INV)
+    # 裁剪到有效区域
     top_left, bottom_right = get_extreme_coordinates(hand_mask)
     hand = hand[top_left[1]:bottom_right[1], top_left[0]:bottom_right[0]]
     hand_mask = hand_mask[top_left[1]:bottom_right[1], top_left[0]:bottom_right[0]]
@@ -70,9 +78,10 @@ def preprocess_hand_image(hand_path, hand_mask_path, variables):
     interp = cv2.INTER_AREA if hand_scale < 1 else cv2.INTER_LINEAR
     hand = cv2.resize(hand, (new_wd, new_ht), interpolation=interp)
     hand_mask = cv2.resize(hand_mask, (new_wd, new_ht), interpolation=interp)
-    hand_mask_inv = 255 - hand_mask
-    hand_mask = hand_mask / 255
-    hand_mask_inv = hand_mask_inv / 255
+    # 归一化蒙版到 0.0~1.0，保留半透明边缘的平滑过渡
+    hand_mask = hand_mask.astype(np.float32) / 255.0
+    hand_mask_inv = 1.0 - hand_mask
+    # 预乘：蒙版外区域置黑
     hand_bg_ind = np.where(hand_mask == 0)
     hand[hand_bg_ind] = [0, 0, 0]
     hand_ht, hand_wd = hand.shape[0], hand.shape[1]
@@ -84,7 +93,7 @@ def preprocess_hand_image(hand_path, hand_mask_path, variables):
     return variables
 
 
-def draw_hand_on_img(drawing, hand, x, y, hand_mask_inv, hand_ht, hand_wd, img_ht, img_wd):
+def draw_hand_on_img(drawing, hand, x, y, hand_mask, hand_mask_inv, hand_ht, hand_wd, img_ht, img_wd):
     remaining_ht = img_ht - y
     remaining_wd = img_wd - x
     crop_hand_ht = min(remaining_ht, hand_ht)
@@ -92,38 +101,181 @@ def draw_hand_on_img(drawing, hand, x, y, hand_mask_inv, hand_ht, hand_wd, img_h
     if crop_hand_ht <= 0 or crop_hand_wd <= 0:
         return drawing
     hand_cropped = hand[:crop_hand_ht, :crop_hand_wd]
+    hand_mask_cropped = hand_mask[:crop_hand_ht, :crop_hand_wd]
     hand_mask_inv_cropped = hand_mask_inv[:crop_hand_ht, :crop_hand_wd]
     for c in range(3):
         drawing[y:y + crop_hand_ht, x:x + crop_hand_wd, c] = (
             drawing[y:y + crop_hand_ht, x:x + crop_hand_wd, c] * hand_mask_inv_cropped
+            + hand_cropped[:, :, c] * hand_mask_cropped
         )
-    drawing[y:y + crop_hand_ht, x:x + crop_hand_wd] += hand_cropped
     return drawing
 
 
-def _sort_cells_by_nearest(indices):
-    """将格子索引按最近邻排序，返回排序后的数组"""
-    indices = indices.copy()
-    sorted_list = [indices[0]]
-    remaining = indices[1:]
-    while len(remaining) > 0:
-        last = sorted_list[-1]
-        dists = euc_dist(remaining, last)
-        nearest = np.argmin(dists)
-        sorted_list.append(remaining[nearest].copy())
-        remaining[nearest] = remaining[-1]
-        remaining = remaining[:-1]
-    return np.array(sorted_list)
+def _split_by_projection(indices, min_gap=2):
+    """递归投影分割：找空白列/行间隙，将格子切分成独立视觉区域"""
+    if len(indices) <= 1:
+        return [indices]
+
+    def _find_splits(coords, min_c, max_c, min_gap):
+        """在 [min_c, max_c] 范围内找连续空白间隙"""
+        occupied = set(coords)
+        splits = []
+        gap_start = None
+        for c in range(min_c, max_c + 1):
+            if c not in occupied:
+                if gap_start is None:
+                    gap_start = c
+            else:
+                if gap_start is not None and c - gap_start >= min_gap:
+                    splits.append((gap_start, c - 1))
+                gap_start = None
+        if gap_start is not None and (max_c + 1) - gap_start >= min_gap:
+            splits.append((gap_start, max_c))
+        return splits
+
+    def _recurse(idx_arr, depth=0):
+        if len(idx_arr) <= 1 or depth > 4:
+            return [idx_arr]
+        # 交替：偶数层切垂直（按列），奇数层切水平（按行）
+        if depth % 2 == 0:
+            coords = idx_arr[:, 1]  # 列
+        else:
+            coords = idx_arr[:, 0]  # 行
+        min_c, max_c = int(coords.min()), int(coords.max())
+        splits = _find_splits(set(coords.tolist()), min_c, max_c, min_gap)
+        if not splits:
+            # 当前方向没有间隙，换另一个方向再试一次
+            if depth % 2 == 0:
+                coords2 = idx_arr[:, 0]
+            else:
+                coords2 = idx_arr[:, 1]
+            min_c2, max_c2 = int(coords2.min()), int(coords2.max())
+            splits2 = _find_splits(
+                set(coords2.tolist()), min_c2, max_c2, min_gap
+            )
+            if not splits2:
+                return [idx_arr]
+            # 用另一方向的间隙切分
+            boundaries = [min_c2] + [s[0] for s in splits2] + [max_c2 + 1]
+            result = []
+            for i in range(len(boundaries) - 1):
+                lo, hi = boundaries[i], boundaries[i + 1]
+                if i > 0:
+                    lo = splits2[i - 1][1] + 1
+                mask = (coords2 >= lo) & (coords2 < hi)
+                if mask.any():
+                    result.extend(_recurse(idx_arr[mask], depth + 1))
+            return result if result else [idx_arr]
+        # 用间隙切分
+        boundaries = [min_c] + [s[0] for s in splits] + [max_c + 1]
+        result = []
+        for i in range(len(boundaries) - 1):
+            lo, hi = boundaries[i], boundaries[i + 1]
+            if i > 0:
+                lo = splits[i - 1][1] + 1
+            mask = (coords >= lo) & (coords < hi)
+            if mask.any():
+                result.extend(_recurse(idx_arr[mask], depth + 1))
+        return result if result else [idx_arr]
+
+    return _recurse(indices)
 
 
-def _sample_cells(sorted_cells, target_count):
-    """从排序后的格子中均匀采样/扩展到目标数量"""
-    n = len(sorted_cells)
-    if target_count == n:
-        return sorted_cells
-    # 无论目标多于或少于实际数量，都通过 linspace 均匀映射
-    indices = np.round(np.linspace(0, n - 1, target_count)).astype(int)
-    return sorted_cells[indices]
+def _dbscan_numpy(indices, eps=3.0):
+    """纯 numpy DBSCAN 聚类，返回聚类列表"""
+    n = len(indices)
+    if n <= 1:
+        return [indices]
+    # 计算 pairwise 距离
+    pts = indices.astype(np.float64)
+    diff = pts[:, np.newaxis, :] - pts[np.newaxis, :, :]
+    dists = np.sqrt((diff ** 2).sum(axis=2))
+    # 找邻居
+    neighbors = [np.where(dists[i] <= eps)[0] for i in range(n)]
+    labels = -np.ones(n, dtype=int)
+    cluster_id = 0
+    for i in range(n):
+        if labels[i] != -1:
+            continue
+        # 扩展聚类
+        queue = list(neighbors[i])
+        labels[i] = cluster_id
+        while queue:
+            j = queue.pop(0)
+            if labels[j] != -1:
+                continue
+            labels[j] = cluster_id
+            queue.extend(neighbors[j].tolist())
+        cluster_id += 1
+    return [indices[labels == cid] for cid in range(cluster_id)]
+
+
+def _sort_cells_local(indices, alpha=0.5):
+    """带从左到右偏好的最近邻排序，避免在聚类内部频繁回退"""
+    n = len(indices)
+    if n <= 1:
+        return indices.copy()
+    pool = indices.copy()
+    # 从最左上的格子开始
+    start = np.lexsort((pool[:, 0], pool[:, 1]))[0]
+    # 把起始点交换到位置 0
+    pool[[0, start]] = pool[[start, 0]]
+    tail = n  # pool[:tail] 是剩余候选
+    result = np.empty_like(pool)
+    result[0] = pool[0]
+    tail -= 1
+    # 把已选的位置 0 换到末尾
+    pool[[0, tail]] = pool[[tail, 0]]
+    for i in range(1, n):
+        last = result[i - 1]
+        candidates = pool[:tail]
+        dists = euc_dist(candidates, last)
+        # 对向左回退的格子加惩罚
+        backward = np.maximum(0, last[1] - candidates[:, 1]).astype(float)
+        effective_dists = dists + alpha * backward
+        nearest = np.argmin(effective_dists)
+        result[i] = candidates[nearest]
+        tail -= 1
+        pool[[nearest, tail]] = pool[[tail, nearest]]
+    return result
+
+
+def _build_drawing_path(indices, target_count):
+    """三阶段管线：投影分割 → 距离聚类 → 聚类内排序 + 按比例采样"""
+    # Stage 1: 投影分割
+    regions = _split_by_projection(indices, min_gap=2)
+    # Stage 2: 距离聚类
+    clusters = []
+    for region in regions:
+        if len(region) == 0:
+            continue
+        sub = _dbscan_numpy(region, eps=3.0)
+        clusters.extend(sub)
+    clusters = [c for c in clusters if len(c) > 0]
+    if not clusters:
+        return indices
+    # 按阅读顺序排列聚类（先左后右、先上后下）
+    cluster_keys = [(c[:, 1].min(), c[:, 0].min()) for c in clusters]
+    order = sorted(range(len(clusters)), key=lambda i: cluster_keys[i])
+    clusters = [clusters[i] for i in order]
+    # Stage 3: 聚类内排序
+    sorted_clusters = [_sort_cells_local(c) for c in clusters]
+    # 按比例分配目标帧数，组内独立采样
+    total_cells = sum(len(c) for c in sorted_clusters)
+    result = []
+    remaining_target = target_count
+    remaining_cells = total_cells
+    for cl in sorted_clusters:
+        if remaining_cells <= 0:
+            break
+        group_target = round(len(cl) / remaining_cells * remaining_target)
+        group_target = max(group_target, 1)
+        n = len(cl)
+        sample_idx = np.round(np.linspace(0, n - 1, group_target)).astype(int)
+        result.append(cl[sample_idx])
+        remaining_target -= group_target
+        remaining_cells -= len(cl)
+    return np.concatenate(result)
 
 
 def draw_masked_object(variables, target_cells, skip_rate=SKIP_RATE):
@@ -144,9 +296,8 @@ def draw_masked_object(variables, target_cells, skip_rate=SKIP_RATE):
     actual_cells = len(cut_black_indices)
     print(f"  网格总数: {n_cuts_vertical}x{n_cuts_horizontal}, 有内容的格子: {actual_cells}, 目标格子数: {target_cells}")
 
-    # 按最近邻排序后均匀采样
-    sorted_cells = _sort_cells_by_nearest(cut_black_indices)
-    sampled_cells = _sample_cells(sorted_cells, target_cells)
+    # 三阶段路径排序：投影分割 → 距离聚类 → 聚类内排序
+    sampled_cells = _build_drawing_path(cut_black_indices, target_cells)
     total = len(sampled_cells)
 
     for i, cell in enumerate(sampled_cells):
@@ -169,6 +320,7 @@ def draw_masked_object(variables, target_cells, skip_rate=SKIP_RATE):
                 variables["drawn_frame"].copy(),
                 variables["hand"].copy(),
                 hand_coord_x, hand_coord_y,
+                variables["hand_mask"].copy(),
                 variables["hand_mask_inv"].copy(),
                 variables["hand_ht"], variables["hand_wd"],
                 resize_ht, resize_wd,
@@ -185,17 +337,14 @@ def draw_masked_object(variables, target_cells, skip_rate=SKIP_RATE):
             print(f"  进度: {pct}% ({counter}/{total})")
 
     # 确保最后一帧内容完整写入（补齐所有未采样的格子到画布）
-    for cell in sorted_cells:
+    for cell in cut_black_indices:
         r, c_idx = cell[0], cell[1]
-        range_v_start = r * split_len
-        range_v_end = range_v_start + split_len
-        range_h_start = c_idx * split_len
-        range_h_end = range_h_start + split_len
-        temp = np.zeros((split_len, split_len, 3))
-        temp[:, :, 0] = grid_of_cuts[r][c_idx]
-        temp[:, :, 1] = grid_of_cuts[r][c_idx]
-        temp[:, :, 2] = grid_of_cuts[r][c_idx]
-        variables["drawn_frame"][range_v_start:range_v_end, range_h_start:range_h_end] = temp
+        vs = r * split_len
+        hs = c_idx * split_len
+        gray_block = grid_of_cuts[r][c_idx]
+        variables["drawn_frame"][vs:vs + split_len, hs:hs + split_len] = (
+            np.stack([gray_block] * 3, axis=-1)
+        )
 
     print(f"  绘制完成，共 {total} 步")
 
@@ -229,7 +378,7 @@ def _apply_brush(drawn_frame, color_img, cx, cy, brush_mask, radius):
         drawn_frame[y1:y2, x1:x2, c] = (
             drawn_frame[y1:y2, x1:x2, c] * (1.0 - mask_region) +
             color_img[y1:y2, x1:x2, c] * mask_region
-        ).astype(np.uint8)
+        )
 
 
 def colorize_animation(variables, target_cells, skip_rate=SKIP_RATE, brush_radius=50):
@@ -255,9 +404,8 @@ def colorize_animation(variables, target_cells, skip_rate=SKIP_RATE, brush_radiu
     cut_having_black = np.sum(np.sum(cut_having_black, axis=-1), axis=-1)
     cut_black_indices = np.array(np.where(cut_having_black > 0)).T
 
-    # 按最近邻排序后均匀采样
-    sorted_cells = _sort_cells_by_nearest(cut_black_indices)
-    sampled_cells = _sample_cells(sorted_cells, target_cells)
+    # 三阶段路径排序：投影分割 → 距离聚类 → 聚类内排序
+    sampled_cells = _build_drawing_path(cut_black_indices, target_cells)
     total = len(sampled_cells)
 
     brush_mask = _build_brush_mask(brush_radius)
@@ -276,6 +424,7 @@ def colorize_animation(variables, target_cells, skip_rate=SKIP_RATE, brush_radiu
                 variables["drawn_frame"].copy().astype(np.uint8),
                 variables["hand"].copy(),
                 cx, cy,
+                variables["hand_mask"].copy(),
                 variables["hand_mask_inv"].copy(),
                 variables["hand_ht"], variables["hand_wd"],
                 resize_ht, resize_wd,
@@ -295,8 +444,6 @@ def colorize_animation(variables, target_cells, skip_rate=SKIP_RATE, brush_radiu
             pct = int(counter / total * 100)
             print(f"  上色进度: {pct}%")
 
-    # 确保最终画面是完整的彩色原图
-    variables["drawn_frame"] = variables["img"].astype(np.float32).copy()
     print(f"  上色完成，共 {total} 步")
 
 
@@ -419,7 +566,7 @@ def main():
         if not os.path.exists(HAND_PATH):
             print(f"错误: 手部素材不存在: {HAND_PATH}")
             sys.exit(1)
-        variables = preprocess_hand_image(HAND_PATH, HAND_MASK_PATH, variables)
+        variables = preprocess_hand_image(HAND_PATH, variables)
         print(f"  手部尺寸: {variables['hand_wd']}x{variables['hand_ht']}")
 
     # 根据 duration 反算每阶段目标格子数
