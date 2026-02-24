@@ -26,6 +26,7 @@ END_IMG_DURATION = 2
 MAX_1080P = True
 DEFAULT_DURATION = 10
 SKIP_RATE = 4
+HAND_TARGET_HT = 493  # 手部素材缩放到的目标高度（基于 1080p 画布的最佳尺寸）
 
 
 # === 核心函数 ===
@@ -33,28 +34,6 @@ SKIP_RATE = 4
 def euc_dist(arr1, point):
     square_sub = (arr1 - point) ** 2
     return np.sqrt(np.sum(square_sub, axis=1))
-
-
-def find_nearest_res(given):
-    arr = np.array([640, 360, 480, 1280, 720, 1920, 1080, 2560, 1440, 3840, 2160, 7680, 4320])
-    idx = (np.abs(arr - given)).argmin()
-    return arr[idx]
-
-
-def resize_with_padding(img, target_width, target_height, color=(255, 255, 255)):
-    h, w = img.shape[:2]
-    scale = min(target_width / w, target_height / h)
-    new_w = int(w * scale)
-    new_h = int(h * scale)
-    resized = cv2.resize(img, (new_w, new_h), interpolation=cv2.INTER_AREA)
-    pad_w = target_width - new_w
-    pad_h = target_height - new_h
-    top = pad_h // 2
-    bottom = pad_h - top
-    left = pad_w // 2
-    right = pad_w - left
-    padded = cv2.copyMakeBorder(resized, top, bottom, left, right, cv2.BORDER_CONSTANT, value=color)
-    return padded
 
 
 def get_extreme_coordinates(mask):
@@ -69,8 +48,6 @@ def get_extreme_coordinates(mask):
 def preprocess_image(img, variables):
     img = cv2.resize(img, (variables["resize_wd"], variables["resize_ht"]))
     img_gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
-    clahe = cv2.createCLAHE(clipLimit=2.0, tileGridSize=(3, 3))
-    clahe.apply(img_gray)
     img_thresh = cv2.adaptiveThreshold(
         img_gray, 255, cv2.ADAPTIVE_THRESH_GAUSSIAN_C, cv2.THRESH_BINARY, 15, 10
     )
@@ -86,6 +63,13 @@ def preprocess_hand_image(hand_path, hand_mask_path, variables):
     top_left, bottom_right = get_extreme_coordinates(hand_mask)
     hand = hand[top_left[1]:bottom_right[1], top_left[0]:bottom_right[0]]
     hand_mask = hand_mask[top_left[1]:bottom_right[1], top_left[0]:bottom_right[0]]
+    # 按高度缩放到固定目标尺寸，宽度等比跟随
+    hand_scale = HAND_TARGET_HT / hand.shape[0]
+    new_ht = HAND_TARGET_HT
+    new_wd = max(1, int(hand.shape[1] * hand_scale))
+    interp = cv2.INTER_AREA if hand_scale < 1 else cv2.INTER_LINEAR
+    hand = cv2.resize(hand, (new_wd, new_ht), interpolation=interp)
+    hand_mask = cv2.resize(hand_mask, (new_wd, new_ht), interpolation=interp)
     hand_mask_inv = 255 - hand_mask
     hand_mask = hand_mask / 255
     hand_mask_inv = hand_mask_inv / 255
@@ -218,7 +202,6 @@ def draw_masked_object(variables, target_cells, skip_rate=SKIP_RATE):
 
 def _build_brush_mask(radius):
     """预生成一个圆形笔刷蒙版，边缘高斯羽化，值域 0.0~1.0"""
-    size = radius * 2 + 1
     y, x = np.ogrid[-radius:radius + 1, -radius:radius + 1]
     dist = np.sqrt(x * x + y * y).astype(np.float32)
     mask = np.clip(1.0 - (dist - radius * 0.75) / (radius * 0.25), 0, 1)
@@ -320,8 +303,7 @@ def colorize_animation(variables, target_cells, skip_rate=SKIP_RATE, brush_radiu
 def ffmpeg_convert(source_vid, dest_vid):
     try:
         import av
-        src_path = Path(source_vid)
-        input_container = av.open(src_path, mode="r")
+        input_container = av.open(source_vid, mode="r")
         output_container = av.open(dest_vid, mode="w")
         in_stream = input_container.streams.video[0]
         width = in_stream.codec_context.width
@@ -398,12 +380,11 @@ def main():
     img_ht, img_wd = image_bgr.shape[0], image_bgr.shape[1]
     print(f"  原始尺寸: {img_wd}x{img_ht}")
 
-    # 计算目标分辨率（保持原始宽高比）
+    # 计算目标分辨率（保持原始宽高比，长边统一缩放到 1080）
     max_dim = 1080 if MAX_1080P else max(img_wd, img_ht)
-    if img_wd > max_dim or img_ht > max_dim:
-        scale = max_dim / max(img_wd, img_ht)
-        img_wd = int(img_wd * scale)
-        img_ht = int(img_ht * scale)
+    scale = max_dim / max(img_wd, img_ht)
+    img_wd = int(img_wd * scale)
+    img_ht = int(img_ht * scale)
     # 确保宽高为 SPLIT_LEN 的倍数（网格切分需要）且为偶数（视频编码需要）
     lcm = SPLIT_LEN if SPLIT_LEN % 2 == 0 else SPLIT_LEN * 2
     img_wd = (img_wd // lcm) * lcm
