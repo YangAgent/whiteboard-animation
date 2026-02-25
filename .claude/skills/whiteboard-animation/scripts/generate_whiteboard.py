@@ -420,15 +420,17 @@ def main():
         variables = preprocess_hand_image(HAND_PATH, variables)
         print(f"  手部尺寸: {variables['hand_wd']}x{variables['hand_ht']}")
 
-    # 根据 duration 反算每阶段目标格子数
+    # 根据 duration 反算每阶段目标格子数（线稿:上色 = 2:1）
     end_frames = FRAME_RATE * END_IMG_DURATION
     total_frames = duration * FRAME_RATE
     anim_frames = total_frames - end_frames
-    frames_per_phase = anim_frames // 2
-    target_cells = frames_per_phase * skip_rate
+    sketch_frames = anim_frames * 2 // 3
+    color_frames = anim_frames - sketch_frames
+    sketch_target_cells = sketch_frames * skip_rate
+    color_target_cells = color_frames * skip_rate
     print(f"\n时长计算: {duration}秒 = {total_frames}帧")
-    print(f"  动画帧: {anim_frames}, 每阶段: {frames_per_phase}帧")
-    print(f"  skip_rate={skip_rate}, 目标格子数: {target_cells}")
+    print(f"  动画帧: {anim_frames}, 线稿: {sketch_frames}帧, 上色: {color_frames}帧 (2:1)")
+    print(f"  skip_rate={skip_rate}, 线稿格子数: {sketch_target_cells}, 上色格子数: {color_target_cells}")
 
     # 创建视频写入器
     fourcc = cv2.VideoWriter_fourcc(*"mp4v")
@@ -446,12 +448,12 @@ def main():
     print(f"\n开始生成动画 (split_len={SPLIT_LEN}, skip_rate={skip_rate})...")
     start_time = time.time()
 
-    draw_masked_object(variables, target_cells, skip_rate=skip_rate)
+    draw_masked_object(variables, sketch_target_cells, skip_rate=skip_rate)
 
     # 第二阶段：上色
     print("\n开始上色阶段...")
     colorize_animation(
-        variables, target_cells, skip_rate=skip_rate, brush_radius=50
+        variables, color_target_cells, skip_rate=skip_rate, brush_radius=50
     )
 
     # 结尾展示完整彩色原图
